@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, BackfillCompletePayload, EntryPayload, PageResult
 from app.services import service_for
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -95,4 +95,12 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/backfill_job/{entry_id}/complete", response_model=ActionResult)
+def complete_backfill(entry_id: int, payload: BackfillCompletePayload) -> ActionResult:
+    """完成回填任务并交付回填完成记录，供治理报告汇总完成量和条数。"""
+    service = require_service("backfill_job")
+    entry, message = service.complete_backfill(entry_id, payload.total_records)
     return ActionResult(ok=entry is not None, message=message, entry=entry)

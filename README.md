@@ -79,5 +79,21 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 回填完成记录与治理报告增量汇总
+
+- 回填任务完成时交付一份**回填完成记录**（任务号、任务名称、目标湖表、
+  回填时间范围、处理条数），接口为 `POST /api/backfill_job/{id}/complete`
+  （body：`{ "total_records": 120 }`），记录写入台账
+  `GET /api/cross/backfill-completions`。同一任务重复送达只保留首份记录。
+- 治理报告生成时不再每次重扫全量完成记录，而是从上次确认的
+  `event_watermark` 之后增量同步；连续生成两份无新回填的报告，总量与明细
+  保持同一组任务。回填中的任务不占完成量。
+- 报告上的 `回填数据统计` 同时给出 `completed_tasks`、`total_records` 和
+  `tasks` 明细；`GET /api/cross/backfill-stats` 可单独查看已确认统计。
+  重新读取报告（列表或详情）时按明细复算总量，明细相加与回填条数一致。
+- 值班员可用 `POST /api/cross/backfill-completions/{id}/redeliver` 重送完成回执，
+  验证重复回执不会让报告重复累计。
+- 生成期间中途退出后再生成，会复用首次固定的那组任务，不换批次。
+
 领域：数据工程
 子方向：数仓与数据湖

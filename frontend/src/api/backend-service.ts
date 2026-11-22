@@ -37,6 +37,23 @@ export async function runAction(
   return await response.json()
 }
 
+/** 完成回填任务：后端交付回填完成记录，治理报告据此汇总完成量和条数。 */
+export async function completeBackfill(id: number, totalRecords: number): Promise<ActionResult> {
+  const response = await request(`/api/backfill_job/${id}/complete`, {
+    method: 'POST',
+    body: JSON.stringify({ total_records: totalRecords }),
+  })
+  return await response.json()
+}
+
+/** 重送一条回填完成回执：模拟同一份完成记录重复送到，报告侧按任务去重。 */
+export async function redeliverCompletion(id: number): Promise<ActionResult> {
+  const response = await request(`/api/cross/backfill-completions/${id}/redeliver`, {
+    method: 'POST',
+  })
+  return await response.json()
+}
+
 export async function downloadEntries(
   key: string,
   filters: Record<string, string> = {},

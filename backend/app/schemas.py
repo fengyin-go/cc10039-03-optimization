@@ -29,3 +29,8 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class BackfillCompletePayload(BaseModel):
+    total_records: int = Field(ge=0)
+    remark: str | None = None

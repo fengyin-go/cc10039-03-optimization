@@ -647,3 +647,231 @@ class TestCrossModulePipeline:
             assert svc.ENTITY, f"{type(svc).__name__} missing ENTITY"
             assert svc.LIST_FIELDS, f"{type(svc).__name__} missing LIST_FIELDS"
             assert svc.STATUS_ORDER, f"{type(svc).__name__} missing STATUS_ORDER"
+
+class TestBackfillCompletionLedger:
+    """回填完成记录 → 治理报告增量汇总"""
+
+    def setup_method(self):
+        # 每个用例把全局数据仓库重置回种子状态，避免用例间互相影响
+        from app.store import store as global_store
+        global_store.__init__()
+        BackfillJobService._checkpoints.clear()
+        self.store = global_store
+        self.bs = BackfillJobService()
+        self.gs = GovernReportService()
+
+    def teardown_method(self):
+        from app.store import store as global_store
+        global_store.__init__()
+        BackfillJobService._checkpoints.clear()
+
+    def _new_report(self, period: str) -> int:
+        entry, missing = self.gs.create_entry({
+            "报告周期": period, "治理指标": "指标", "优化建议": "建议",
+        })
+        assert entry is not None
+        return entry["id"]
+
+    def _complete_new_task(self, name: str, records: int) -> int:
+        entry, missing = self.bs.create_entry({
+            "任务名称": name, "目标湖表": f"{name}-表", "回填时间范围": "2026-10",
+        })
+        assert entry is not None
+        task_id = entry["id"]
+        started, msg = self.bs.start_backfill(task_id)
+        assert started is not None, msg
+        done, msg = self.bs.complete_backfill(task_id, records)
+        assert done is not None, msg
+        return task_id
+
+    def test_completing_task_delivers_completion_record(self):
+        task_id = self._complete_new_task("回填A", 120)
+        record = self.bs.completion_record_for(task_id)
+        assert record is not None
+        assert record["task_id"] == str(task_id)
+        assert record["record_count"] == 120
+
+    def test_consecutive_reports_do_not_rescan_completion_records(self):
+        self._complete_new_task("回填A", 120)
+        self._complete_new_task("回填B", 80)
+
+        first_id = self._new_report("周期1")
+        _, msg1 = self.gs.generate_report(first_id)
+        assert "回填任务=2" in msg1 and "回填条数=200" in msg1
+
+        second_id = self._new_report("周期2")
+        _, msg2 = self.gs.generate_report(second_id)
+        assert "回填任务=2" in msg2 and "回填条数=200" in msg2
+
+        stats = self.store.govern_backfill_stats()
+        assert stats["completed_tasks"] == 2
+        assert stats["total_records"] == 200
+
+    def test_duplicate_receipt_counted_once(self):
+        task_id = self._complete_new_task("回填A", 120)
+        report_id = self._new_report("周期1")
+        self.gs.generate_report(report_id)
+
+        # 同一任务完成记录重复送到
+        again, msg = self.bs.complete_backfill(task_id, 120)
+        assert again is not None
+        assert "去重" in msg
+        self.bs.redeliver_completion(task_id)
+
+        # 再生成一份新报告，重复回执不应让完成量翻倍
+        next_id = self._new_report("周期2")
+        self.gs.generate_report(next_id)
+        stats = self.gs.get_entry(next_id)["回填数据统计"]
+        assert stats["completed_tasks"] == 1
+        assert stats["total_records"] == 120
+
+    def test_duplicate_and_new_task_in_same_report(self):
+        first_task = self._complete_new_task("回填A", 120)
+        report_id = self._new_report("周期1")
+        self.gs.generate_report(report_id)
+
+        # 报告生成中重发一条完成回执，同时另一项任务刚好完成
+        self.bs.redeliver_completion(first_task)
+        new_task = self._complete_new_task("回填B", 55)
+
+        next_report = self._new_report("周期2")
+        entry, msg = self.gs.generate_report(next_report)
+        assert entry is not None, msg
+        stats = entry["回填数据统计"]
+        task_ids = {task["task_id"] for task in stats["tasks"]}
+        assert task_ids == {str(first_task), str(new_task)}
+        assert stats["completed_tasks"] == 2
+        assert stats["total_records"] == 175
+        assert stats["total_records"] == sum(
+            task["record_count"] for task in stats["tasks"]
+        )
+
+    def test_in_progress_task_not_counted(self):
+        running, missing = self.bs.create_entry({
+            "任务名称": "回填中任务", "目标湖表": "表-回填中", "回填时间范围": "2026-10",
+        })
+        assert running is not None
+        self.bs.start_backfill(running["id"])
+
+        done_task = self._complete_new_task("回填A", 60)
+        report_id = self._new_report("周期1")
+        entry, msg = self.gs.generate_report(report_id)
+        assert entry is not None, msg
+        stats = entry["回填数据统计"]
+        assert {task["task_id"] for task in stats["tasks"]} == {str(done_task)}
+        assert stats["total_records"] == 60
+
+    def test_interrupted_generation_reuses_confirmed_tasks(self):
+        first_task = self._complete_new_task("回填A", 120)
+
+        # 第一次生成时已固定任务组，随后中途退出（未确认落库）
+        report_id = self._new_report("周期1")
+        draft = self.gs.sync_backfill_stats()
+        self.store.stage_govern_backfill_draft(report_id, draft)
+
+        # 生成期间另一项任务完成
+        second_task = self._complete_new_task("回填B", 55)
+
+        entry, msg = self.gs.generate_report(report_id)
+        assert entry is not None, msg
+        stats = entry["回填数据统计"]
+        assert {task["task_id"] for task in stats["tasks"]} == {str(first_task)}
+        assert stats["total_records"] == 120
+
+        # 新任务留给下一份报告
+        next_report = self._new_report("周期2")
+        next_entry, _ = self.gs.generate_report(next_report)
+        assert {
+            task["task_id"] for task in next_entry["回填数据统计"]["tasks"]
+        } == {str(first_task), str(second_task)}
+
+    def test_reopen_recomputes_total_from_listed_tasks(self):
+        self._complete_new_task("回填A", 120)
+        self._complete_new_task("回填B", 80)
+        report_id = self._new_report("周期1")
+        self.gs.generate_report(report_id)
+
+        reopened = self.gs.get_entry(report_id)["回填数据统计"]
+        assert reopened["total_records"] == sum(
+            task["record_count"] for task in reopened["tasks"]
+        )
+        assert reopened["completed_tasks"] == len(reopened["tasks"])
+
+        rows, total = self.gs.list_entries(page=1, size=20)
+        assert total >= 1
+        listed = next(row for row in rows if row["id"] == report_id)
+        assert listed["回填数据统计"]["total_records"] == reopened["total_records"]
+
+    def test_sync_only_scans_after_watermark(self):
+        """连续报告只从上次水位线之后扫描，不重扫已确认完成记录。"""
+        self._complete_new_task("回填A", 100)
+        first_id = self._new_report("周期1")
+        self.gs.generate_report(first_id)
+        watermark = self.store.govern_backfill_stats()["event_watermark"]
+
+        scanned: list[int] = []
+        original = self.store.events_since
+
+        def spy(start: int):
+            scanned.append(start)
+            return original(start)
+
+        self.store.events_since = spy  # type: ignore[method-assign]
+        try:
+            second_id = self._new_report("周期2")
+            self.gs.generate_report(second_id)
+        finally:
+            self.store.events_since = original  # type: ignore[method-assign]
+
+        assert scanned and scanned[0] == watermark
+
+    def test_reopen_recomputes_total_even_if_stored_total_is_stale(self):
+        """重新进入报告时按明细复算，不信任报告上可能过期的总量。"""
+        self._complete_new_task("回填A", 120)
+        self._complete_new_task("回填B", 80)
+        report_id = self._new_report("周期1")
+        self.gs.generate_report(report_id)
+
+        entry = self.store.find("govern_report", report_id)
+        entry["回填数据统计"]["total_records"] = 9999
+        entry["回填数据统计"]["completed_tasks"] = 99
+
+        reopened = self.gs.get_entry(report_id)["回填数据统计"]
+        assert reopened["total_records"] == 200
+        assert reopened["completed_tasks"] == 2
+        assert reopened["total_records"] == sum(
+            task["record_count"] for task in reopened["tasks"]
+        )
+
+    def test_report_with_no_new_backfill_keeps_same_totals(self):
+        """连续生成两份无新回填的报告，总量和明细保持同一组任务。"""
+        self._complete_new_task("回填A", 120)
+        first_id = self._new_report("周期1")
+        self.gs.generate_report(first_id)
+        first_stats = self.gs.get_entry(first_id)["回填数据统计"]
+
+        second_id = self._new_report("周期2")
+        self.gs.generate_report(second_id)
+        second_stats = self.gs.get_entry(second_id)["回填数据统计"]
+
+        assert first_stats == second_stats
+        assert second_stats["total_records"] == 120
+
+    def test_regenerate_same_report_accumulates_without_duplicates(self):
+        """同一份报告再次生成时只并入新任务，旧任务不重复累计。"""
+        first_task = self._complete_new_task("回填A", 120)
+        report_id = self._new_report("周期1")
+        self.gs.generate_report(report_id)
+
+        second_task = self._complete_new_task("回填B", 55)
+        entry, msg = self.gs.generate_report(report_id)
+        assert entry is not None, msg
+        stats = entry["回填数据统计"]
+        assert {task["task_id"] for task in stats["tasks"]} == {str(first_task), str(second_task)}
+        assert stats["total_records"] == 175
+
+        # 重复回执后再生成一次，明细和总量都不变
+        self.bs.redeliver_completion(first_task)
+        again, _ = self.gs.generate_report(report_id)
+        assert again["回填数据统计"]["total_records"] == 175
+        assert len(again["回填数据统计"]["tasks"]) == 2

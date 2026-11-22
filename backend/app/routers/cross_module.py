@@ -1,7 +1,8 @@
 """跨模块编排端点：暴露跨模块数据流链路、事件日志和快照信息。
 
 提供 /api/cross/events, /api/cross/snapshots, /api/cross/pipeline-status 等端点，
-让前端和治理报告可以消费跨模块链路数据。
+让前端和治理报告可以消费跨模块链路数据。回填完成记录和回填数据统计也挂在这里，
+值班员可以按明细追溯计入完成量的任务。
 """
 from __future__ import annotations
 
@@ -120,3 +121,38 @@ def pipeline_status() -> dict[str, Any]:
             "all_lake_tables_registered": len(registered_tables) == len(lake_tables),
         },
     }
+
+
+@router.get("/backfill-completions")
+def list_backfill_completions() -> dict[str, Any]:
+    """回填完成记录台账：治理报告汇总回填完成量和条数的唯一来源。"""
+    records = store.backfill_completion_records()
+    return {
+        "total": len(records),
+        "total_records": sum(int(r.get("record_count", 0)) for r in records),
+        "items": records,
+    }
+
+
+@router.get("/backfill-completions/{task_id}")
+def get_backfill_completion(task_id: str) -> dict[str, Any]:
+    """按任务号取回唯一的一份回填完成记录。"""
+    record = store.backfill_completion_for(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"回填任务 {task_id} 还没有完成记录")
+    return record
+
+
+@router.post("/backfill-completions/{task_id}/redeliver")
+def redeliver_backfill_completion(task_id: str) -> dict[str, Any]:
+    """重送一条完成回执：模拟同一份完成记录重复送到，按任务号幂等。"""
+    if not task_id.isdigit():
+        raise HTTPException(status_code=404, detail=f"回填任务 {task_id} 不存在")
+    entry, message = BackfillJobService().redeliver_completion(int(task_id))
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.get("/backfill-stats")
+def backfill_stats() -> dict[str, Any]:
+    """回填数据统计：按任务明细复算计入的记录总量。"""
+    return GovernReportService().current_backfill_stats()

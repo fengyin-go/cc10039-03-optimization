@@ -5,7 +5,35 @@ export type EntryRow = {
   status: string
   pending: boolean
   abnormal: boolean
-  [field: string]: string | number | boolean
+  回填数据统计?: BackfillStats
+  回填完成记录?: BackfillCompletionRecord
+  [field: string]: unknown
+}
+
+/** 回填任务完成后交付的完成记录：带任务和处理条数。 */
+export type BackfillCompletionRecord = {
+  seq: number
+  task_id: string
+  task_name: string
+  table_name: string
+  time_range: string
+  record_count: number
+}
+
+/** 治理报告上的回填数据统计：明细是计入完成量的任务清单。 */
+export type BackfillTaskDetail = {
+  task_id: string
+  task_name: string
+  table_name: string
+  time_range: string
+  record_count: number
+}
+
+export type BackfillStats = {
+  completed_backfills?: number
+  completed_tasks: number
+  total_records: number
+  tasks: BackfillTaskDetail[]
 }
 
 export type ModuleMeta = {
@@ -30,6 +58,7 @@ export type PageResult = {
 export type ActionResult = {
   ok: boolean
   message: string
+  entry?: EntryRow | null
 }
 
 export type OverviewResult = {

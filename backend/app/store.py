@@ -21,6 +21,21 @@ class Store:
         self._events: list[dict[str, Any]] = []
         # 模块快照备份：用于检查点和恢复
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
+        # 回填完成记录台账：task_id → 唯一的完成记录（重复回执只保留一份）
+        self._backfill_completion_records: dict[str, dict[str, Any]] = {}
+        # 回填完成记录按确认顺序追加，seq 单调递增供治理报告追溯
+        self._backfill_completion_log: list[dict[str, Any]] = []
+        self._backfill_completion_seq = 0
+        # 治理报告的回填数据统计：event_watermark 之前的事件已确认计入，不再重复扫描
+        self._govern_backfill_stats: dict[str, Any] = {
+            "event_watermark": 0,
+            "completed_tasks": 0,
+            "total_records": 0,
+            "tasks": [],
+            "updated_at": None,
+        }
+        # 生成中的报告草稿：中途退出后重试仍复用首次确认的那组任务
+        self._govern_backfill_drafts: dict[int, dict[str, Any]] = {}
 
     # ---- 基础读写 ----
 
@@ -85,6 +100,97 @@ class Store:
             e for e in self._events
             if e["source_module"] == source and e["target_module"] == target
         ]
+
+    def event_log_length(self) -> int:
+        """当前事件日志长度，可作为增量消费的水位线。"""
+        return len(self._events)
+
+    def events_since(self, start: int) -> list[dict[str, Any]]:
+        """读取水位线之后新增的事件，不重复扫描历史日志。"""
+        if start < 0:
+            start = 0
+        return list(self._events[start:])
+
+    # ---- 回填完成记录 ----
+
+    def record_backfill_completion(
+        self,
+        task_id: str,
+        *,
+        task_name: str = "",
+        table_name: str = "",
+        time_range: str = "",
+        record_count: int = 0,
+        source: str = "backfill_job",
+    ) -> tuple[dict[str, Any], bool]:
+        """登记一条回填完成记录。
+
+        同一任务重复送到完成回执时只保留首次确认的记录，返回 duplicated=True，
+        调用方据此避免在任务数和条数上重复累计。
+        """
+        key = str(task_id)
+        existing = self._backfill_completion_records.get(key)
+        if existing is not None:
+            return existing, True
+
+        self._backfill_completion_seq += 1
+        record = {
+            "seq": self._backfill_completion_seq,
+            "task_id": key,
+            "task_name": task_name,
+            "table_name": table_name,
+            "time_range": time_range,
+            "record_count": int(record_count),
+            "source": source,
+            "recorded_at": datetime.datetime.now().isoformat(),
+        }
+        self._backfill_completion_records[key] = record
+        self._backfill_completion_log.append(record)
+        return record, False
+
+    def backfill_completion_records(self) -> list[dict[str, Any]]:
+        """按登记顺序返回全部已确认的回填完成记录（副本，避免外部改写台账）。"""
+        return [dict(record) for record in self._backfill_completion_log]
+
+    def backfill_completion_for(self, task_id: str) -> dict[str, Any] | None:
+        record = self._backfill_completion_records.get(str(task_id))
+        return dict(record) if record is not None else None
+
+    def govern_backfill_stats(self) -> dict[str, Any]:
+        """返回治理报告已确认的回填数据统计（不重扫历史完成记录）。"""
+        return self._govern_backfill_stats
+
+    def save_govern_backfill_stats(self, stats: dict[str, Any]) -> None:
+        """确认一份回填统计落库。
+
+        水位线只前进不后退，任务明细按任务号并集保留，避免先生成、后确认的
+        旧快照把已确认的任务覆盖掉，造成后续报告再次扫描历史完成记录。
+        """
+        previous = self._govern_backfill_stats
+        merged: dict[str, Any] = {}
+        for task in [*previous.get("tasks", []), *stats.get("tasks", [])]:
+            merged.setdefault(str(task["task_id"]), task)
+        tasks = sorted(merged.values(), key=lambda task: int(task.get("seq", 0)))
+        self._govern_backfill_stats = {
+            **stats,
+            "event_watermark": max(
+                int(previous.get("event_watermark", 0)),
+                int(stats.get("event_watermark", 0)),
+            ),
+            "tasks": [dict(task) for task in tasks],
+            "completed_tasks": len(tasks),
+            "total_records": sum(int(task.get("record_count", 0)) for task in tasks),
+        }
+
+    def govern_backfill_draft(self, report_id: int) -> dict[str, Any] | None:
+        """取生成中报告已固定的回填统计草稿，用于中途退出后的重试。"""
+        return self._govern_backfill_drafts.get(int(report_id))
+
+    def stage_govern_backfill_draft(self, report_id: int, stats: dict[str, Any]) -> None:
+        self._govern_backfill_drafts[int(report_id)] = stats
+
+    def discard_govern_backfill_draft(self, report_id: int) -> None:
+        self._govern_backfill_drafts.pop(int(report_id), None)
 
     # ---- 快照与检查点 ----
 
